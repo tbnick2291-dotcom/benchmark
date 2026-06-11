@@ -1,0 +1,2 @@
+[console_scripts]
+benchmark = benchmark_cli.main:cli
