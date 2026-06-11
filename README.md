@@ -108,14 +108,272 @@ Step 4  更新 Elo 积分，记录胜负，角色互换
 
 ## 六、数据库结构（7张表）
 
+7 张表的关系可以用一句话概括：**模型参加任务，任务产生题目，题目引发对战，对战更新积分，积分和对战共同生成报告。**
+
+### 表关系总览
+
 ```
-models          → 注册的模型信息
-evaluation_tasks → 评测任务（一个任务包含多轮对战）
-questions       → 每轮生成的题目
-battles         → 每场对战的详细记录（题目、双方回答、胜负）
-elo_ratings     → 各模型在各维度的 Elo 积分
-weakness_analysis → 各模型的弱点分析
-reports         → 生成的评测报告
+models ──┬──────────────────────────────────────────┐
+         │                                          │
+         ▼                                          │
+evaluation_tasks                                   │
+         │                                          │
+         ▼                                          │
+questions (attacker_id → models)                   │
+         │                                          │
+         ▼                                          ▼
+battles ──────────────── elo_ratings (model_id → models)
+         │                                          │
+         └──────────────────────────────────────────┤
+                                                    ▼
+                                         weakness_analysis
+                                                    │
+                                                    ▼
+                                                 reports
+```
+
+---
+
+### 表 1：models（模型注册表）
+
+**作用：** 系统里所有参与评测的模型都在这里注册，相当于"选手名单"。
+
+```
+字段          类型        说明
+─────────────────────────────────────────────────────
+id            整数        主键，自增
+name          字符串      模型的显示名称，全局唯一
+              (100字符)   例如："llama3-8b"、"gpt-4o"
+model_path    字符串      实际调用时传给 API 的模型标识
+              (500字符)   例如："/models/llama3" 或 "gpt-4o"
+config        JSON       扩展配置（温度、最大 token 等），可为空
+status        字符串      当前状态：inactive（未加载）/ active（已加载）
+created_at    时间戳      注册时间
+updated_at    时间戳      最后修改时间（状态变更时自动更新）
+```
+
+**name 和 model_path 的区别：**
+- `name` 是给人看的标签，比如"公司内部模型-v2"
+- `model_path` 是实际传给 vLLM API 的参数，比如 `/models/qwen2-7b`
+
+**status 的流转：**
+```
+注册后 → inactive
+用户点"Load" → active（表示这个模型当前可以参与评测）
+用户点"Unload" → inactive
+```
+
+---
+
+### 表 2：evaluation_tasks（评测任务表）
+
+**作用：** 一个"任务"就是一次完整的评测活动，可以包含多个模型、多个维度、多轮对战。
+
+```
+字段          类型        说明
+─────────────────────────────────────────────────────
+id            整数        主键
+name          字符串      任务名称，例如："知识维度-第一轮"
+dimension     字符串      评测维度：knowledge / reasoning / code / safety
+task_type     字符串      任务类型：目前只有 "adversarial"（对抗式）
+config        JSON       任务参数，存储参赛模型 ID 列表和对战轮数
+              例如：{"model_ids": [1, 2, 3], "rounds": 5}
+status        字符串      任务状态（见下方流转图）
+created_by    整数(外键)  创建此任务的模型 ID（预留字段，目前为空）
+created_at    时间戳      创建时间
+completed_at  时间戳      完成时间（任务结束时写入）
+```
+
+**status 流转：**
+```
+创建后 → pending（等待开始）
+点击 Start → running（正在跑）
+全部对战结束 → completed（完成）
+模型不足/出错 → failed（失败）
+```
+
+**config 字段示例：**
+```json
+{
+  "model_ids": [1, 2],
+  "rounds": 5
+}
+```
+这表示模型 1 和模型 2 各打 5 轮，系统会自动算出总对战场数：2个模型 × 5轮 × 2方向（A打B + B打A）= 20场。
+
+---
+
+### 表 3：questions（评测题目表）
+
+**作用：** 每场对战中，攻击方生成的题目都会存在这里，方便事后复盘"出了什么题"。
+
+```
+字段             类型        说明
+─────────────────────────────────────────────────────
+id               整数        主键
+task_id          整数(外键)  属于哪个评测任务
+content          文本        题目的完整内容（可能很长，用 Text 类型）
+category         字符串      题目分类，对应维度名称
+difficulty       字符串      难度标记（目前由模型自行决定，未强制写入）
+generation_type  字符串      生成方式：目前固定为 "adversarial"
+attacker_id      整数(外键)  出这道题的模型 ID
+expected_answer  文本        攻击方认为的参考答案（可为空）
+created_at       时间戳      题目生成时间
+```
+
+**为什么要单独存题目？**
+
+题目和对战是分开的。一道题可以被多次引用（比如同一道题让不同模型来答），也方便后续做题库分析——哪类题让模型最容易出错，哪个模型出的题最刁钻。
+
+---
+
+### 表 4：battles（对战记录表）
+
+**作用：** 每一场对战的完整记录，是整个系统最核心的数据表，所有分析都从这里来。
+
+```
+字段             类型        说明
+─────────────────────────────────────────────────────
+id               整数        主键
+question_id      整数(外键)  本场对战用的题目
+attacker_id      整数(外键)  攻击方模型 ID（出题的）
+defender_id      整数(外键)  防守方模型 ID（答题的）
+attacker_answer  文本        攻击方对这道题自己的回答（参考用）
+defender_answer  文本        防守方的完整回答
+winner           字符串      胜者：attacker / defender / tie
+judge_reason     文本        裁判给出的判决理由（一句话说明为什么这样判）
+judged_by        整数(外键)  担任裁判的模型 ID
+battle_time      时间戳      对战发生时间
+```
+
+**一场完整对战的数据长这样：**
+
+```
+question_id:     42
+attacker_id:     1  (llama3)
+defender_id:     2  (gpt-4o)
+attacker_answer: "答案是贝叶斯定理的后验概率..."
+defender_answer: "这道题考察的是条件概率，根据公式..."
+winner:          "defender"
+judge_reason:    "防守方给出了完整正确的推导过程，攻击方答案有误"
+judged_by:       1  (llama3 自己担任裁判)
+battle_time:     2026-06-11 14:23:01
+```
+
+**注意：** `judged_by` 目前是攻击方自己，这意味着攻击方既出题又判题，存在潜在偏见。这是已知局限，后续版本会支持配置独立第三方裁判。
+
+---
+
+### 表 5：elo_ratings（Elo 积分表）
+
+**作用：** 存储每个模型在每个评测维度下的当前积分和战绩统计。
+
+```
+字段        类型        说明
+─────────────────────────────────────────────────────
+id          整数        主键
+model_id    整数(外键)  哪个模型
+dimension   字符串      哪个维度（knowledge / reasoning / code / safety）
+rating      浮点数      当前 Elo 积分，初始值 1500.0
+wins        整数        累计胜场
+losses      整数        累计负场
+ties        整数        累计平局
+updated_at  时间戳      最后一次积分更新时间
+```
+
+**唯一约束：`(model_id, dimension)` 组合唯一**
+
+一个模型在一个维度下只有一条记录，每次对战结束后直接更新这条记录的 `rating`、`wins`、`losses`。
+
+**数据示例：**
+
+```
+model_id  dimension   rating   wins  losses  ties
+1         knowledge   1563.2   8     3       1
+1         reasoning   1487.6   4     6       2
+2         knowledge   1436.8   3     8       1
+2         reasoning   1512.4   6     4       2
+```
+
+可以看出：模型1在知识维度强，模型2在推理维度强。这就是分维度排名的价值。
+
+---
+
+### 表 6：weakness_analysis（弱点分析表）
+
+**作用：** 记录每个模型在哪些类型的题上容易失败，供下一轮攻击者"精准打击"。
+
+```
+字段             类型        说明
+─────────────────────────────────────────────────────
+id               整数        主键
+model_id         整数(外键)  哪个模型
+category         字符串      弱点类别，例如："多步推理"、"边界条件"
+fail_rate        浮点数      在该类别题目上的失败率（0.0 ~ 1.0）
+typical_errors   JSON       典型错误示例，存若干个失败案例的摘要
+attack_patterns  JSON       针对这个弱点的有效攻击模式
+last_updated     时间戳      最后分析时间
+```
+
+**目前的状态：这张表是空的。**
+
+弱点分析是系统设计中的"学习机制"——理论上每轮对战结束后应该统计失败模式并写入这里，下一轮攻击方查询对手弱点后再有针对性地出题。
+
+这个自动写入逻辑目前未实现（是后续迭代方向之一）。当前的代码在 `benchmark_runner.py` 中有查询弱点的逻辑，但没有写入弱点的逻辑——攻击方会查这张表，查到空就按默认策略出题。
+
+---
+
+### 表 7：reports（评测报告表）
+
+**作用：** 对某个模型生成的综合评测报告，内容是对前面所有表数据的聚合汇总。
+
+```
+字段          类型        说明
+─────────────────────────────────────────────────────
+id            整数        主键
+model_id      整数(外键)  针对哪个模型的报告
+task_ids      JSON       基于哪些任务生成（任务 ID 列表）
+report_type   字符串      报告类型：full（完整）/ summary（摘要）
+content       JSON       报告正文（见下方结构）
+generated_at  时间戳      生成时间
+```
+
+**content 字段的数据结构：**
+
+```json
+{
+  "model_id": 1,
+  "elo_by_dimension": {
+    "knowledge": {"rating": 1563.2, "wins": 8, "losses": 3, "ties": 1},
+    "reasoning": {"rating": 1487.6, "wins": 4, "losses": 6, "ties": 2}
+  },
+  "overall_wins": 12,
+  "total_battles": 24,
+  "win_rate": 0.5,
+  "weaknesses": [
+    {"category": "多步推理", "fail_rate": 0.75}
+  ],
+  "generated_at": "2026-06-11T14:30:00"
+}
+```
+
+报告是"快照"——生成时把当前数据固化下来。之后再跑新的评测，旧报告不会变，需要重新生成一份新报告才能看到最新数据。
+
+---
+
+### 7张表的数据生命周期
+
+```
+用户操作                    写入的表
+──────────────────────────────────────────────────────
+注册模型                 → models
+创建评测任务             → evaluation_tasks
+点击 Start 开始评测      → （触发以下自动流程）
+  攻击方生成题目         → questions
+  双方完成答题和评判     → battles
+  更新积分               → elo_ratings
+  （弱点学习，待实现）   → weakness_analysis
+用户手动生成报告         → reports
 ```
 
 ---
