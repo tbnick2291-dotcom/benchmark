@@ -14,5 +14,8 @@ def cli(ctx: click.Context, url: str):
     ctx.obj = Context(url)
 
 
-from benchmark_cli.commands import model
+from benchmark_cli.commands import model, task, report, status
 cli.add_command(model.group, name="model")
+cli.add_command(task.group, name="task")
+cli.add_command(report.group, name="report")
+cli.add_command(status.command, name="status")
