@@ -14,8 +14,5 @@ def cli(ctx: click.Context, url: str):
     ctx.obj = Context(url)
 
 
-# Commands will be added after their modules are created
-# cli.add_command(model.group, name="model")
-# cli.add_command(task.group, name="task")
-# cli.add_command(report.group, name="report")
-# cli.add_command(status.command, name="status")
+from benchmark_cli.commands import model
+cli.add_command(model.group, name="model")
