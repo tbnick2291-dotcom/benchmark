@@ -1,0 +1,5 @@
+database_url: "postgresql+asyncpg://benchmark:benchmark@localhost:5432/benchmark"
+vllm_base_url: "http://localhost:8000/v1"
+elo_k_factor: 32.0
+elo_initial_rating: 1500.0
+debug: true
