@@ -120,18 +120,170 @@ reports         → 生成的评测报告
 
 ---
 
-## 七、技术栈
+## 七、技术栈详解
 
-| 层级 | 技术 |
-|------|------|
-| 后端框架 | FastAPI (Python 3.11) |
-| 数据库 | SQLite（开发）/ PostgreSQL（生产） |
-| ORM | SQLAlchemy 2.x 异步 |
-| 模型推理 | 任意 OpenAI 兼容 API（vLLM / Ollama / 云 API） |
-| 前端 | Vue 3 + Vite + Element Plus |
-| 图表 | ECharts |
-| 状态管理 | Pinia |
-| CLI | Click + Rich |
+### 7.1 后端框架：FastAPI (Python 3.11)
+
+**为什么选 FastAPI，而不是 Django / Flask？**
+
+这个项目的核心操作是调用 LLM API：出题、答题、判题，每次调用都要等模型返回（通常 2-30 秒）。如果用同步框架（Flask/Django），每次等待期间线程被阻塞，10 个并发请求就需要 10 个线程，扩展性差。
+
+FastAPI 基于 Python asyncio，等待模型返回时不阻塞线程，可以同时处理其他请求，天然适合"大量 IO 等待"的场景。
+
+| | FastAPI | Flask | Django |
+|---|---|---|---|
+| 异步支持 | ✅ 原生 | ⚠️ 需扩展 | ⚠️ 部分支持 |
+| 自动生成 API 文档 | ✅ 内置 Swagger | ❌ | ❌ |
+| 性能 | 高 | 中 | 中 |
+| 适合 AI 项目 | ✅ | 一般 | 一般 |
+
+**对 Python 版本的要求：Python 3.11+**
+
+原因：`asyncpg`（PostgreSQL 异步驱动）和 `pydantic v2` 在 3.11 以下有兼容问题，且 3.11 的异步性能比 3.10 提升约 25%。
+
+---
+
+### 7.2 数据库：SQLite（开发）/ PostgreSQL（生产）
+
+**两种数据库分场景使用：**
+
+| | SQLite | PostgreSQL |
+|---|---|---|
+| 安装 | 无需安装，Python 内置 | 需要独立安装和配置 |
+| 并发写入 | ❌ 同一时刻只能一个写操作 | ✅ 支持高并发 |
+| JSON 字段性能 | 一般 | 高（原生 JSONB 索引） |
+| 适合场景 | 本地开发、单人使用、演示 | 团队部署、多人并发使用 |
+| 切换成本 | 只需改一行配置 | 需要安装 PostgreSQL 服务 |
+
+**目前使用 SQLite 的原因：** 无需额外安装数据库服务，一行配置即可启动，适合快速验证和演示。
+
+**什么时候需要切换到 PostgreSQL：**
+- 多人同时发起评测任务（并发写入会冲突）
+- 数据量超过 10 万条记录（SQLite 查询开始变慢）
+- 需要在多台机器上共享数据
+
+切换方式：修改 `config/config.yaml` 中的 `database_url` 一行即可，代码不需要改动。
+
+---
+
+### 7.3 ORM：SQLAlchemy 2.x 异步
+
+**ORM 是什么：** 让你用 Python 对象操作数据库，不用手写 SQL。
+
+**为什么用 SQLAlchemy 而不是直接写 SQL？**
+
+- 同一套代码同时支持 SQLite 和 PostgreSQL，切换数据库不改业务代码
+- 异步版本（`asyncio` 模式）与 FastAPI 配合，不阻塞事件循环
+- 自动管理连接池，防止数据库连接泄漏
+
+**版本要求：SQLAlchemy 2.x**（不能用 1.x）
+
+1.x 的异步支持是实验性的，写法繁琐；2.x 重写了异步 API，写法更简洁，且与 Pydantic v2 的集成更好。
+
+---
+
+### 7.4 模型推理层：OpenAI 兼容 API
+
+**核心设计：不绑定任何具体模型或平台。**
+
+只要对方提供一个符合 OpenAI 格式的接口（`POST /v1/chat/completions`），就能接入。这是目前事实上的行业标准，主流工具都支持：
+
+| 工具 | 适用场景 | 启动方式 |
+|------|---------|---------|
+| vLLM | 有 GPU，跑开源大模型 | `python -m vllm.entrypoints.openai.api_server --model xxx` |
+| Ollama | 本地轻量部署，CPU 也能跑 | `ollama serve` |
+| LM Studio | 有界面，适合非技术人员 | 点击"Start Server" |
+| OpenAI API | 直接用 GPT 系列 | 填 `https://api.openai.com/v1` |
+| 公司内部 API | 对接内部模型服务 | 填对应地址 + 配置 token |
+
+**对外部服务的超时要求：**
+
+代码中设置了 120 秒超时（`httpx.AsyncClient(timeout=120.0)`）。大模型生成一个完整回答通常需要 5-30 秒，设置 120 秒是为了给复杂推理任务留出足够时间。如果你的模型响应很慢，可以在 `vllm_client.py` 中调大这个值。
+
+---
+
+### 7.5 前端：Vue 3 + Vite + Element Plus
+
+**为什么选 Vue 3，而不是 React？**
+
+| | Vue 3 | React |
+|---|---|---|
+| 上手难度 | 低，模板语法接近 HTML | 中，需要理解 JSX |
+| 适合场景 | 中后台管理系统 | 复杂交互产品 |
+| 配套 UI 库 | Element Plus（专为中后台设计） | Ant Design / MUI |
+| 国内生态 | 非常活跃 | 活跃 |
+
+这个项目本质是一个**内部管理工具**（注册模型、查排行榜、看报告），Vue 3 + Element Plus 是国内中后台系统的主流组合，开发效率高，组件开箱即用。
+
+**为什么用 Vite 而不是 Webpack？**
+
+Vite 在开发模式下不打包，直接用浏览器原生 ES Module，启动速度从 10-30 秒降到 1 秒以内。开发体验差距很明显。
+
+**Node.js 版本要求：18+**
+
+Vite 5 要求 Node.js 18 以上。低于 18 会在 `npm run dev` 时报错。
+
+---
+
+### 7.6 图表：ECharts
+
+**为什么选 ECharts，而不是 Chart.js / D3？**
+
+- ECharts 是百度开源，中文文档完善，国内社区活跃
+- 柱状图、折线图、热力图开箱即用，配置简单
+- 与 Vue 3 集成用 `vue-echarts` 包装，5 行代码出一张图
+- Chart.js 功能偏简单；D3 功能强大但学习曲线陡，适合定制可视化
+
+目前用于：Elo 积分柱状图、胜率对比图。后续可扩展积分变化折线图、对战热力图。
+
+---
+
+### 7.7 状态管理：Pinia
+
+**Pinia 是 Vue 3 官方推荐的状态管理库**，取代了旧版的 Vuex。
+
+作用：在多个页面之间共享数据。比如在 Dashboard 加载了模型列表，跳转到 Tasks 页面创建任务时，不需要重新请求 API，直接从 Pinia store 里取数据。
+
+**为什么不用 Vuex？**
+
+Vuex 4 是为 Vue 2 设计的，在 Vue 3 中写法繁琐（需要 mutations/actions 分离）。Pinia 专为 Vue 3 设计，写法简洁，且对 TypeScript 支持更好。
+
+---
+
+### 7.8 CLI：Click + Rich
+
+**Click：Python 命令行框架**
+
+负责解析命令和参数。比如 `benchmark model list --url http://xxx` 这样的命令格式，由 Click 处理。
+
+选 Click 的原因：
+- Python 生态最主流的 CLI 框架，文档齐全
+- 自动生成 `--help` 说明
+- 支持子命令嵌套（`benchmark model list`、`benchmark task create`）
+
+**Rich：终端美化库**
+
+负责在终端里输出漂亮的表格、彩色文字、进度条。
+
+没有 Rich：
+```
+1 llama3 /models/llama3 active
+2 gpt4 /models/gpt4 inactive
+```
+
+有 Rich：
+```
+┌────────────────────────────────┐
+│       Registered Models        │
+├──┬───────┬──────────────┬──────┤
+│ID│ Name  │    Path      │Status│
+├──┼───────┼──────────────┼──────┤
+│ 1│ llama3│/models/llama3│active│
+│ 2│ gpt4  │/models/gpt4  │  -   │
+└──┴───────┴──────────────┴──────┘
+```
+
+对于要给技术部门演示的工具，终端输出的可读性很重要。
 
 ---
 
