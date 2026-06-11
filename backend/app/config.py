@@ -2,6 +2,9 @@ from pydantic_settings import BaseSettings
 import yaml
 from pathlib import Path
 
+# 相对于 config.py 本身定位项目根目录：backend/app/config.py → ../../ → 项目根
+_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
+
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://benchmark:benchmark@localhost:5432/benchmark"
@@ -13,11 +16,10 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "BENCHMARK_", "extra": "ignore"}
 
 
-def load_settings(config_path: str = "config/config.yaml") -> Settings:
-    path = Path(config_path)
+def load_settings(config_path: Path = _DEFAULT_CONFIG_PATH) -> Settings:
     overrides = {}
-    if path.exists():
-        with open(path) as f:
+    if config_path.exists():
+        with open(config_path) as f:
             overrides = yaml.safe_load(f) or {}
     return Settings(**overrides)
 
